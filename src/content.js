@@ -36,9 +36,9 @@ async function refreshStatus() {
     }
 
     if (response.canDownload) {
-      setStatus(`Ready (${response.seenPlaylists} playlists, ${response.seenChunks} chunks)`);
+      setStatus(`Ready (${response.seenChunks} chunks seen)`);
     } else {
-      setStatus("Play the track to capture stream data.");
+      setStatus("Play the track to capture stream chunks.");
     }
   } catch (_error) {
     setStatus("Extension background is unavailable.");
@@ -47,7 +47,7 @@ async function refreshStatus() {
 
 async function onDownloadClick() {
   const meta = readTrackMeta();
-  setStatus("Building local file... this may take a while.");
+  setStatus("Building audio file... this may take a while.");
 
   const result = await chrome.runtime.sendMessage({
     type: "download-track",
@@ -59,7 +59,7 @@ async function onDownloadClick() {
     return;
   }
 
-  setStatus(`Saved ${result.filename} (${result.quality}, ${result.chunks} parts)`);
+  setStatus(`Downloaded ${result.filename} (${result.chunks} chunks)`);
 }
 
 function readTrackMeta() {

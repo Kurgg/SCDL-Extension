@@ -2,14 +2,12 @@
 
 This extension adds a small **Download backup** button on `soundcloud.com` while you listen to a track.
 
-It captures playlist/chunk URLs from SoundCloud playback traffic, resolves the highest-bitrate HLS variant when available, fetches all media parts, and writes one local file through Chrome downloads.
+It watches SoundCloud segment traffic (`dataNNN.m4s`) from the browser, then rebuilds a single downloadable file (`.m4a`) from those chunks.
 
 > Important: Use this only for content you are authorized to archive (for example, your own uploads).
 
-## Output format and quality
-- Preferred path: HLS `.m3u8` playlist capture, then choose the highest `BANDWIDTH` variant in that playlist.
-- Fallback path: direct `dataNNN.m4s` chunk pattern reconstruction.
-- The saved output usually becomes `.m4a` (AAC/fMP4 stream). In some stream layouts, it may save as `.ts`.
+## Why `.m4a` and not `.mp3`?
+SoundCloud streaming chunks in this flow are AAC in MP4 segments (`audio/mp4`), so this extension rebuilds to `.m4a` directly. Browser extensions cannot reliably transcode to MP3 without heavy tooling.
 
 ## Install
 1. Open `chrome://extensions`
@@ -19,11 +17,10 @@ It captures playlist/chunk URLs from SoundCloud playback traffic, resolves the h
 
 ## Use
 1. Open a SoundCloud track page and start playback.
-2. Wait until the widget says `Ready`.
+2. Wait until the widget says **Ready**.
 3. Click **Download backup**.
 4. Choose save location when prompted.
 
-## Troubleshooting
-- If download fails, reload the page, play longer, and retry.
-- Keep extension + tab open while building the local file.
-- Very large tracks can hit browser memory limits when generating a single local data URL.
+## Notes
+- Best results when the track is fully playable in your browser session.
+- If chunks stop early, play through more of the track and retry.

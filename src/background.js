@@ -3,9 +3,9 @@ const tabState = new Map();
 function getOrCreateState(tabId) {
   if (!tabState.has(tabId)) {
     tabState.set(tabId, {
-      chunkSet: new Set(),
-      chunkTemplate: null,
-      playlists: new Set(),
+      chunks: new Set(),
+      baseUrl: null,
+      query: "",
       lastSeenAt: Date.now()
     });
   }
@@ -15,21 +15,22 @@ function getOrCreateState(tabId) {
   return state;
 }
 
-function parseChunkTemplate(urlString) {
+function parseChunkInfo(urlString) {
   const url = new URL(urlString);
   const match = url.pathname.match(/\/(data)(\d+)\.m4s$/i);
+
   if (!match) {
     return null;
   }
 
-  return {
-    index: Number(match[2]),
-    template: `${url.origin}${url.pathname.replace(/\d+\.m4s$/i, "{index}.m4s")}${url.search}`
-  };
-}
+  const index = Number(match[2]);
+  const prefixPath = url.pathname.replace(/\d+\.m4s$/i, "");
 
-function isPlaylistUrl(urlString) {
-  return /\.m3u8(\?|$)/i.test(urlString);
+  return {
+    index,
+    origin: `${url.origin}${prefixPath}`,
+    query: url.search
+  };
 }
 
 chrome.webRequest.onCompleted.addListener(
@@ -38,25 +39,24 @@ chrome.webRequest.onCompleted.addListener(
       return;
     }
 
+    const chunkInfo = parseChunkInfo(details.url);
+    if (!chunkInfo) {
+      return;
+    }
+
     const state = getOrCreateState(details.tabId);
-
-    if (isPlaylistUrl(details.url)) {
-      state.playlists.add(details.url);
-      return;
-    }
-
-    const parsed = parseChunkTemplate(details.url);
-    if (!parsed) {
-      return;
-    }
-
-    state.chunkSet.add(parsed.index);
-    state.chunkTemplate = parsed.template;
+    state.chunks.add(chunkInfo.index);
+    state.baseUrl = chunkInfo.origin;
+    state.query = chunkInfo.query;
   },
-  { urls: ["https://playback.media-streaming.soundcloud.cloud/*"] }
+  {
+    urls: ["https://playback.media-streaming.soundcloud.cloud/*"]
+  }
 );
 
-chrome.tabs.onRemoved.addListener((tabId) => tabState.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabState.delete(tabId);
+});
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "get-capture-status") {
@@ -69,12 +69,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const state = tabState.get(tabId);
     sendResponse({
       ok: true,
-      seenChunks: state?.chunkSet?.size ?? 0,
-      seenPlaylists: state?.playlists?.size ?? 0,
-      canDownload: Boolean(
-        (state?.chunkTemplate && (state?.chunkSet?.size ?? 0) > 0) ||
-          (state?.playlists && state.playlists.size > 0)
-      )
+      seenChunks: state?.chunks?.size ?? 0,
+      canDownload: Boolean(state?.baseUrl && (state?.chunks?.size ?? 0) > 0)
     });
     return;
   }
@@ -87,12 +83,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     const state = tabState.get(tabId);
-    if (!state) {
-      sendResponse({ ok: false, error: "No stream data captured yet. Play the track first." });
+    if (!state?.baseUrl || state.chunks.size === 0) {
+      sendResponse({ ok: false, error: "No captured audio segments yet. Start playback first." });
       return;
     }
 
-    buildAndDownload(state, message.meta)
+    rebuildAndDownload(state, message.meta)
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
 
@@ -100,154 +96,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-async function buildAndDownload(state, meta) {
-  let build;
+async function rebuildAndDownload(state, meta) {
+  const chunkNumbers = [...state.chunks].sort((a, b) => a - b);
+  const firstChunk = chunkNumbers[0];
+  const chunks = [];
 
-  if (state.playlists.size > 0) {
-    build = await buildFromBestPlaylist([...state.playlists]);
-  }
-
-  if (!build && state.chunkTemplate && state.chunkSet.size > 0) {
-    build = await buildFromChunkPattern(state.chunkTemplate, [...state.chunkSet]);
-  }
-
-  if (!build || !build.buffers.length) {
-    throw new Error("Unable to rebuild audio. Play the track for longer and retry.");
-  }
-
-  const artist = sanitize(meta?.artist || "unknown-artist");
-  const title = sanitize(meta?.title || "unknown-track");
-  const ext = build.ext || "m4a";
-  const filename = `SoundCloud/${artist} - ${title}.${ext}`;
-
-  const dataUrl = arrayBuffersToDataUrl(build.buffers, build.mime);
-
-  const downloadId = await chrome.downloads.download({
-    url: dataUrl,
-    filename,
-    saveAs: true,
-    conflictAction: "uniquify"
-  });
-
-  return {
-    downloadId,
-    filename,
-    chunks: build.buffers.length,
-    mode: build.mode,
-    quality: build.quality
-  };
-}
-
-async function buildFromBestPlaylist(playlistUrls) {
-  for (const playlistUrl of playlistUrls.reverse()) {
-    try {
-      const rootText = await fetchText(playlistUrl);
-      const mediaPlaylistUrl = await resolveMediaPlaylistUrl(rootText, playlistUrl);
-      const mediaText = await fetchText(mediaPlaylistUrl);
-      const segmentUrls = parseSegmentUrls(mediaText, mediaPlaylistUrl);
-      if (!segmentUrls.length) {
-        continue;
-      }
-
-      const buffers = await fetchAllBuffers(segmentUrls);
-      if (!buffers.length) {
-        continue;
-      }
-
-      const quality = extractBandwidth(rootText);
-      const hasTs = segmentUrls.some((u) => /\.ts(\?|$)/i.test(u));
-      return {
-        mode: "hls",
-        quality: quality ? `${Math.round(quality / 1000)} kbps variant` : "best available variant",
-        buffers,
-        mime: hasTs ? "video/mp2t" : "audio/mp4",
-        ext: hasTs ? "ts" : "m4a"
-      };
-    } catch (_error) {
-      // try next captured playlist
-    }
-  }
-
-  return null;
-}
-
-async function resolveMediaPlaylistUrl(rootText, rootUrl) {
-  if (!/#EXT-X-STREAM-INF/i.test(rootText)) {
-    return rootUrl;
-  }
-
-  const lines = rootText.split(/\r?\n/);
-  let best = null;
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i].trim();
-    if (!line.startsWith("#EXT-X-STREAM-INF")) {
-      continue;
-    }
-
-    const bandwidthMatch = line.match(/BANDWIDTH=(\d+)/i);
-    const bandwidth = bandwidthMatch ? Number(bandwidthMatch[1]) : 0;
-    const nextLine = lines[i + 1]?.trim();
-    if (!nextLine || nextLine.startsWith("#")) {
-      continue;
-    }
-
-    if (!best || bandwidth > best.bandwidth) {
-      best = {
-        bandwidth,
-        url: new URL(nextLine, rootUrl).toString()
-      };
-    }
-  }
-
-  return best?.url || rootUrl;
-}
-
-function parseSegmentUrls(mediaText, mediaUrl) {
-  const lines = mediaText.split(/\r?\n/);
-  const urls = [];
-
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) {
-      continue;
-    }
-
-    if (line.startsWith("#EXT-X-MAP")) {
-      const mapMatch = line.match(/URI="([^"]+)"/i);
-      if (mapMatch?.[1]) {
-        urls.push(new URL(mapMatch[1], mediaUrl).toString());
-      }
-      continue;
-    }
-
-    if (line.startsWith("#")) {
-      continue;
-    }
-
-    urls.push(new URL(line, mediaUrl).toString());
-  }
-
-  return urls;
-}
-
-async function buildFromChunkPattern(template, chunkNumbers) {
-  const sorted = [...new Set(chunkNumbers)].sort((a, b) => a - b);
-  const first = sorted[0];
-  const maxAttempts = Math.max(first + 3000, sorted[sorted.length - 1] + 100);
-
-  const buffers = [];
+  let next = firstChunk;
   let misses = 0;
+  const maxAttempts = Math.max(firstChunk + 3000, chunkNumbers[chunkNumbers.length - 1] + 100);
 
-  for (let n = first; n <= maxAttempts; n += 1) {
-    const url = template.replace("{index}", String(n).padStart(3, "0"));
+  while (next <= maxAttempts) {
+    const chunkUrl = `${state.baseUrl}${String(next).padStart(3, "0")}.m4s${state.query}`;
 
     try {
-      const response = await fetch(url);
+      const response = await fetch(chunkUrl);
       if (!response.ok) {
         misses += 1;
       } else {
-        buffers.push(await response.arrayBuffer());
+        const buffer = await response.arrayBuffer();
+        chunks.push(buffer);
         misses = 0;
       }
     } catch (_error) {
@@ -257,69 +124,35 @@ async function buildFromChunkPattern(template, chunkNumbers) {
     if (misses >= 6) {
       break;
     }
+
+    next += 1;
   }
 
-  if (!buffers.length) {
-    return null;
+  if (chunks.length === 0) {
+    throw new Error("Could not fetch audio chunks. Ensure the track is playable and try again.");
   }
 
-  return {
-    mode: "chunk-pattern",
-    quality: "captured stream variant",
-    buffers,
-    mime: "audio/mp4",
-    ext: "m4a"
-  };
-}
+  const blob = new Blob(chunks, { type: "audio/mp4" });
+  const objectUrl = URL.createObjectURL(blob);
 
-async function fetchAllBuffers(urls) {
-  const buffers = [];
-  for (const url of urls) {
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Segment fetch failed (${response.status})`);
-    }
-    buffers.push(await response.arrayBuffer());
-  }
-  return buffers;
-}
+  const artist = sanitize(meta?.artist || "unknown-artist");
+  const title = sanitize(meta?.title || "unknown-track");
+  const filename = `SoundCloud/${artist} - ${title}.m4a`;
 
-async function fetchText(url) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Request failed (${response.status})`);
-  }
-  return response.text();
-}
-
-function extractBandwidth(text) {
-  const matches = [...text.matchAll(/BANDWIDTH=(\d+)/gi)].map((m) => Number(m[1]));
-  return matches.length ? Math.max(...matches) : null;
-}
-
-function arrayBuffersToDataUrl(buffers, mimeType) {
-  let totalLength = 0;
-  const uints = buffers.map((buffer) => {
-    const arr = new Uint8Array(buffer);
-    totalLength += arr.byteLength;
-    return arr;
+  const downloadId = await chrome.downloads.download({
+    url: objectUrl,
+    filename,
+    saveAs: true,
+    conflictAction: "uniquify"
   });
 
-  const merged = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const arr of uints) {
-    merged.set(arr, offset);
-    offset += arr.byteLength;
-  }
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
 
-  const chunkSize = 0x8000;
-  let binary = "";
-  for (let i = 0; i < merged.length; i += chunkSize) {
-    const slice = merged.subarray(i, i + chunkSize);
-    binary += String.fromCharCode(...slice);
-  }
-
-  return `data:${mimeType};base64,${btoa(binary)}`;
+  return {
+    downloadId,
+    filename,
+    chunks: chunks.length
+  };
 }
 
 function sanitize(value) {
