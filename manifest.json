@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "SoundCloud Track Backup Helper",
+  "description": "Captures SoundCloud audio segment requests and rebuilds a downloadable file for tracks you are authorized to access.",
+  "version": "0.1.0",
+  "permissions": [
+    "webRequest",
+    "downloads",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://*.soundcloud.com/*",
+    "https://playback.media-streaming.soundcloud.cloud/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://soundcloud.com/*"],
+      "js": ["src/content.js"],
+      "css": ["src/content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
